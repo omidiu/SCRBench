@@ -1,0 +1,30 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.sample
+
+# Python and uv environments / build artifacts
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated caches, experiment outputs, and logs
+/cache/
+/cache_old/
+/experiment_results/
+/logs/
+*.log
+/scripts/fig_cross_task.pdf
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
