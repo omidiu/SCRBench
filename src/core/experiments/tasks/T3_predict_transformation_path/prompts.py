@@ -1,13 +1,11 @@
-import ast
 import re
 from typing import List
-
 from core.data_builder.transformations import ALL_TRANSFORMATIONS, TRANSFORMER_IDS
 from core.experiments.prompt_spec import ParseResult, PromptSpec
 
 _VALID_TRANSFORMATION_IDS = set(TRANSFORMER_IDS.values())
 
-T3_V01_TEMPLATE = """You are a Python code expert.
+BASE_TEMPLATE = """You are a Python code expert.
 Your task is to determine which transformations were applied (in order) to **Code 1** to produce **Code 2**.
 
 Please respond **only** with a comma-separated list of transformation IDs in the order they were applied.
@@ -31,31 +29,7 @@ Below is a list of all possible transformations, each with an ID and description
 {code_2}
 """
 
-T3_V02_TEMPLATE = """You are a Python code expert.
-Your task is to determine which transformations were applied (in order) to **Code 1** to produce **Code 2**.
-
-Please respond **only** with a comma-separated list of transformation IDs in the order they were applied.
-Do not include explanations or any additional text.
-
-**Example Response:**
-5, 7, 1
-
-Below is a list of all possible transformations, each with an ID and description. The number of transformations that were actually applied is **{number_of_transformation}**.
-**Available Transformations:**
-{transformation_description}
-
----
-
-**Code 1:**
-{code_1}
-
----
-
-**Code 2:**
-{code_2}
-"""
-
-T3_V03_TEMPLATE = """You are a Python code expert.
+BASE_COT_TEMPLATE = """You are a Python code expert.
 Your task is to determine which transformations were applied (in order) to **Code 1** to produce **Code 2**.
 
 Think step by step: compare Code 1 and Code 2 carefully, identify every syntactic or semantic change, match each change to the most appropriate transformation ID from the available transformations, and determine the order in which the transformations must have been applied.
@@ -79,7 +53,7 @@ Below is a list of all possible transformations, each with an ID and description
 {code_2}
 """
 
-T3_V04_TEMPLATE = """You are a Python code expert.
+BASE_ONE_SHOT_TEMPLATE = """You are a Python code expert.
 Your task is to determine which transformations were applied (in order) to **Code 1** to produce **Code 2**.
 
 Please respond **only** with a comma-separated list of transformation IDs in the order they were applied.
@@ -129,7 +103,7 @@ Run the task on the following input:
 {code_2}
 """
 
-T3_V05_TEMPLATE = """You are a Python code expert.
+BASE_COT_ONE_SHOT_TEMPLATE = """You are a Python code expert.
 Your task is to determine which transformations were applied (in order) to **Code 1** to produce **Code 2**.
 
 Think step by step: compare Code 1 and Code 2 carefully, identify every syntactic or semantic change, match each change to the most appropriate transformation ID from the available transformations, and determine the order in which the transformations must have been applied.
@@ -178,72 +152,57 @@ Run the task on the following input:
 {code_2}
 """
 
+
 def _transformation_description() -> str:
     return "\n".join([f"{t.id}: {t.operational_spec_v2}" for t in ALL_TRANSFORMATIONS])
 
 
-def _build_t3_v1(code_1, code_2):
-    return T3_V01_TEMPLATE.format(
+def _build_base(code_1, code_2):
+    return BASE_TEMPLATE.format(
         transformation_description=_transformation_description(),
         code_1=code_1,
         code_2=code_2,
     )
 
 
-def _build_t3_v2(code_1, code_2, number_of_transformation):
-    return T3_V02_TEMPLATE.format(
-        number_of_transformation=number_of_transformation,
-        transformation_description=_transformation_description(),
-        code_1=code_1,
-        code_2=code_2,
-    )
-
-def _build_t3_v3(code_1, code_2):
-    return T3_V03_TEMPLATE.format(
-        transformation_description=_transformation_description(),
-        code_1=code_1,
-        code_2=code_2,
-    )
-
-def _build_t3_v4(code_1, code_2):
-    return T3_V04_TEMPLATE.format(
-        transformation_description=_transformation_description(),
-        code_1=code_1,
-        code_2=code_2,
-    )
-
-def _build_t3_v5(code_1, code_2):
-    return T3_V05_TEMPLATE.format(
+def _build_base_cot(code_1, code_2):
+    return BASE_COT_TEMPLATE.format(
         transformation_description=_transformation_description(),
         code_1=code_1,
         code_2=code_2,
     )
 
 
-def _build_t3_v1_row(row: object) -> str:
-    return _build_t3_v1(getattr(row, "source"), getattr(row, "destination"))
-
-
-def _build_t3_v2_row(row: object) -> str:
-    paths = ast.literal_eval(getattr(row, "paths"))
-    path_length = len(paths[0])
-    return _build_t3_v2(
-        getattr(row, "source"),
-        getattr(row, "destination"),
-        path_length,
+def _build_base_one_shot(code_1, code_2):
+    return BASE_ONE_SHOT_TEMPLATE.format(
+        transformation_description=_transformation_description(),
+        code_1=code_1,
+        code_2=code_2,
     )
 
 
-def _build_t3_v3_row(row: object) -> str:
-    return _build_t3_v3(getattr(row, "source"), getattr(row, "destination"))
+def _build_base_cot_one_shot(code_1, code_2):
+    return BASE_COT_ONE_SHOT_TEMPLATE.format(
+        transformation_description=_transformation_description(),
+        code_1=code_1,
+        code_2=code_2,
+    )
 
 
-def _build_t3_v4_row(row: object) -> str:
-    return _build_t3_v4(getattr(row, "source"), getattr(row, "destination"))
+def _build_base_row(row: object) -> str:
+    return _build_base(getattr(row, "source"), getattr(row, "destination"))
 
 
-def _build_t3_v5_row(row: object) -> str:
-    return _build_t3_v5(getattr(row, "source"), getattr(row, "destination"))
+def _build_base_cot_row(row: object) -> str:
+    return _build_base_cot(getattr(row, "source"), getattr(row, "destination"))
+
+
+def _build_base_one_shot_row(row: object) -> str:
+    return _build_base_one_shot(getattr(row, "source"), getattr(row, "destination"))
+
+
+def _build_base_cot_one_shot_row(row: object) -> str:
+    return _build_base_cot_one_shot(getattr(row, "source"), getattr(row, "destination"))
 
 
 def _parse_comma_separated_ids(raw: str) -> ParseResult:
@@ -268,40 +227,36 @@ def _parse_comma_separated_ids(raw: str) -> ParseResult:
 
 
 PROMPT_SPECS: dict[str, PromptSpec] = {
-    "T3_v01": PromptSpec(
-        id="T3_v01",
-        build_prompt=_build_t3_v1,
+    "base": PromptSpec(
+        id="base",
+        build_prompt=_build_base,
         parse_response=_parse_comma_separated_ids,
-        build_from_row=_build_t3_v1_row,
+        build_from_row=_build_base_row,
     ),
-    "T3_v02": PromptSpec(
-        id="T3_v02",
-        build_prompt=_build_t3_v2,
+    "base_cot": PromptSpec(
+        id="base_cot",
+        build_prompt=_build_base_cot,
         parse_response=_parse_comma_separated_ids,
-        build_from_row=_build_t3_v2_row,
+        build_from_row=_build_base_cot_row,
     ),
-    "T3_v03": PromptSpec(
-        id="T3_v03",
-        build_prompt=_build_t3_v3,
+    "base_one_shot": PromptSpec(
+        id="base_one_shot",
+        build_prompt=_build_base_one_shot,
         parse_response=_parse_comma_separated_ids,
-        build_from_row=_build_t3_v3_row,
+        build_from_row=_build_base_one_shot_row,
     ),
-    "T3_v04": PromptSpec(
-        id="T3_v04",
-        build_prompt=_build_t3_v4,
+    "base_cot_one_shot": PromptSpec(
+        id="base_cot_one_shot",
+        build_prompt=_build_base_cot_one_shot,
         parse_response=_parse_comma_separated_ids,
-        build_from_row=_build_t3_v4_row,
-    ),
-    "T3_v05": PromptSpec(
-        id="T3_v05",
-        build_prompt=_build_t3_v5,
-        parse_response=_parse_comma_separated_ids,
-        build_from_row=_build_t3_v5_row,
+        build_from_row=_build_base_cot_one_shot_row,
     ),
 }
 
-T3_V01 = PROMPT_SPECS["T3_v01"]
-T3_V02 = PROMPT_SPECS["T3_v02"]
-T3_V03 = PROMPT_SPECS["T3_v03"]
-T3_V04 = PROMPT_SPECS["T3_v04"]
-T3_V05 = PROMPT_SPECS["T3_v05"]
+base = PROMPT_SPECS["base"]
+
+base_cot = PROMPT_SPECS["base_cot"]
+
+base_one_shot = PROMPT_SPECS["base_one_shot"]
+
+base_cot_one_shot = PROMPT_SPECS["base_cot_one_shot"]

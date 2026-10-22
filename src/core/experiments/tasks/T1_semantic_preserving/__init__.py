@@ -1,10 +1,18 @@
-from .prompts import PROMPT_SPECS, T1_V1, T1_V2
+from .prompts import (
+    PROMPT_SPECS,
+    base,
+    base_cot,
+    base_one_shot,
+    base_cot_one_shot,
+)
 from .task import T1SemanticPreservingTask, T1SemanticPreservingTaskRowOutput
 
 __all__ = [
     "PROMPT_SPECS",
-    "T1_V1",
-    "T1_V2",
+    "base",
+    "base_cot",
+    "base_one_shot",
+    "base_cot_one_shot",
     "T1SemanticPreservingTask",
     "T1SemanticPreservingTaskRowOutput",
 ]

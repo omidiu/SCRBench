@@ -1,13 +1,18 @@
-from .prompts import PROMPT_SPECS, T3_V01, T3_V02, T3_V03, T3_V04, T3_V05
+from .prompts import (
+    PROMPT_SPECS,
+    base,
+    base_cot,
+    base_one_shot,
+    base_cot_one_shot,
+)
 from .task import T3PredictTransformationPathTask, T3PredictTransformationPathTaskRowOutput
 
 __all__ = [
     "PROMPT_SPECS",
-    "T3_V01",
-    "T3_V02",
-    "T3_V03",
-    "T3_V04",
-    "T3_V05",
+    "base",
+    "base_cot",
+    "base_one_shot",
+    "base_cot_one_shot",
     "T3PredictTransformationPathTask",
     "T3PredictTransformationPathTaskRowOutput",
 ]

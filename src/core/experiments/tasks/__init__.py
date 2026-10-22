@@ -28,7 +28,7 @@ registered_prompt_specs = {
 
 
 def get_prompt_spec(task_type: TaskType | str, spec_id: str) -> PromptSpec:
-    """Return the registered PromptSpec for a task and variant id (e.g. ``"T2_v4"``)."""
+    """Return the registered PromptSpec for a task and variant id (e.g. ``"base_cot"``)."""
     task_name = task_type.value if isinstance(task_type, TaskType) else task_type
     specs = registered_prompt_specs.get(task_name)
     if specs is None:
@@ -45,7 +45,12 @@ def get_prompt_spec(task_type: TaskType | str, spec_id: str) -> PromptSpec:
 
 def resolve_prompt_spec(task_type: TaskType, spec: PromptSpec) -> PromptSpec:
     """Validate *spec* belongs to *task_type* and return the canonical registry instance."""
-    return get_prompt_spec(task_type, spec.id)
+    canonical = get_prompt_spec(task_type, spec.id)
+    if spec is not canonical:
+        raise ValueError(
+            f"Prompt spec {spec.id!r} does not belong to task {task_type.value!r}."
+        )
+    return canonical
 
 
 __all__ = [
