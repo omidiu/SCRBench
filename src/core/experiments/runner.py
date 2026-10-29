@@ -1,4 +1,5 @@
 import os
+import math
 import re
 import time
 from dataclasses import asdict, dataclass, fields
@@ -6,10 +7,7 @@ from typing import Optional, Tuple, Type
 
 import pandas as pd
 import json
-import os
 from pathlib import Path
-
-import pandas as pd
 from core import project_config
 
 from .enums import LLMModel, ReferenceDataset, TaskType
@@ -189,29 +187,30 @@ def run_experiment(cfg: ExperimentConfig) -> Tuple[str, str]:
 
     finally:
 
-        AggregateWithReferenceFile.aggregate_with_reference_file(
-            task_type=cfg.task_type,
-            folder_path=folder_path,
-            llm_judge_file_path=llm_judge_file_path,
-            refernce_file_path=reference_file_path,
-            run_id=run_id
-        )
-
-        if pbar is not None:
-            pbar.close()
-
-        finished = utc_now_iso()
-        report.finished_at = finished
         try:
-            from datetime import datetime
+            AggregateWithReferenceFile.aggregate_with_reference_file(
+                task_type=cfg.task_type,
+                folder_path=folder_path,
+                llm_judge_file_path=llm_judge_file_path,
+                refernce_file_path=reference_file_path,
+                run_id=run_id
+            )
+        finally:
+            if pbar is not None:
+                pbar.close()
 
-            started_dt = datetime.fromisoformat(report.started_at)
-            finished_dt = datetime.fromisoformat(finished)
-            report.duration_seconds = (finished_dt - started_dt).total_seconds()
-        except Exception:
-            report.duration_seconds = None
+            finished = utc_now_iso()
+            report.finished_at = finished
+            try:
+                from datetime import datetime
 
-        write_report_json(report)
+                started_dt = datetime.fromisoformat(report.started_at)
+                finished_dt = datetime.fromisoformat(finished)
+                report.duration_seconds = (finished_dt - started_dt).total_seconds()
+            except Exception:
+                report.duration_seconds = None
+
+            write_report_json(report)
 
     return llm_judge_file_path, report_file_path
 
@@ -227,204 +226,126 @@ def _transformation_metadata() -> dict:
     }
 
 
+def _optional_integer(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if math.isfinite(number) and number.is_integer() else None
+
+
+def _optional_boolean(value) -> bool | None:
+    if pd.isna(value):
+        return None
+    token = str(value).strip().lower()
+    if token in ("true", "1", "1.0"):
+        return True
+    if token in ("false", "0", "0.0"):
+        return False
+    return None
+
+
 class AggregateWithReferenceFile:
+    """Export completed predictions, aligned by ID, including failed responses.
+
+    Partial runs export only completed rows; unattempted examples are not scored.
+    Duplicate, missing, or unknown pair IDs are rejected rather than guessed.
+    """
+
+    @staticmethod
+    def _read_aligned_rows(result_path: str, reference_path: str):
+        reference = pd.read_csv(reference_path)
+        if Path(result_path).is_file():
+            try:
+                results = pd.read_csv(result_path, keep_default_na=False)
+            except pd.errors.EmptyDataError:
+                results = pd.DataFrame(columns=["pair_id"])
+        else:
+            results = pd.DataFrame(columns=["pair_id"])
+
+        for frame, column in ((reference, "id"), (results, "pair_id")):
+            if column not in frame:
+                raise ValueError(f"Missing required ID column: {column}")
+            ids = frame[column].map(_optional_integer)
+            if ids.isna().any() or ids.duplicated().any():
+                raise ValueError(f"Missing, invalid, or duplicate IDs in {column}")
+            frame[column] = ids.astype("int64")
+
+        unknown = set(results["pair_id"]) - set(reference["id"])
+        if unknown:
+            raise ValueError(f"Result pair IDs absent from reference: {sorted(unknown)}")
+        aligned = reference.set_index("id").loc[results["pair_id"]]
+        return aligned.to_dict("records"), results.to_dict("records"), len(reference)
 
     @classmethod
     def aggregate_with_reference_file(
-        cls, 
-        task_type: TaskType, 
+        cls,
+        task_type: TaskType,
         folder_path: str,
         llm_judge_file_path: str,
         refernce_file_path: str,
-        run_id: str
+        run_id: str,
     ):
-    
-        mapper = {
-            TaskType.T1: cls.__create_json_file_for_t1,
-            TaskType.T2: cls.__create_json_file_for_t2,
-            TaskType.T3: cls.__create_json_file_for_t3,
-        }
-
-        try:
-            handler = mapper[task_type]
-        except KeyError as e:
-            raise ValueError(f"Unsupported task type: {task_type}") from e
-
-        return handler(folder_path, llm_judge_file_path, refernce_file_path, run_id)
-
-    @staticmethod
-    def __create_json_file_for_t1(
-        folder_path: str, 
-        llm_judge_file_path: str, 
-        refernce_file_path: str,
-        run_id: str
-    ):
-        llm_judge_file = pd.read_csv(llm_judge_file_path)
-        reference_file = pd.read_csv(refernce_file_path)
-
-        if len(llm_judge_file) != len(reference_file):
-            raise ValueError(
-                f"Row count mismatch: source has {len(reference_file)}, results has {len(llm_judge_file)}"
-            )
-
-
-        merged = pd.concat([reference_file, llm_judge_file], axis=1)
-        merged = merged.rename(columns={
-            "is_semantically_equivalent": "real_class",
-            "semantic_is_equal": "predicted_class",
-        })
-        
-        columns_to_export = ["source", "destination", "real_class", "predicted_class", "paths", 'raw_response']
-
-        reference_llm_judge_file_name = f'reference_llm_judge_{run_id}.json'
-        reference_llm_judge_path = os.path.join(folder_path, reference_llm_judge_file_name)
-
-        merged[columns_to_export].to_json(
-            reference_llm_judge_path,
-            orient="records",
-            force_ascii=False,
-            indent=2
+        if task_type not in (TaskType.T1, TaskType.T2, TaskType.T3):
+            raise ValueError(f"Unsupported task type: {task_type}")
+        reference_rows, results, reference_count = cls._read_aligned_rows(
+            llm_judge_file_path, refernce_file_path
         )
-
-
-    @staticmethod
-    def __create_json_file_for_t2(
-        folder_path: str, 
-        llm_judge_file_path: str, 
-        refernce_file_path: str,
-        run_id: str
-    ):
-
-        llm_judge_file = pd.read_csv(llm_judge_file_path)
-        reference_file = pd.read_csv(refernce_file_path)
-
-
-        if len(reference_file) != len(llm_judge_file):
-            raise ValueError(
-                f"Row count mismatch: source has {len(reference_file)}, results has {len(llm_judge_file)}"
-            )
-
         rows = []
-        for i in range(len(reference_file)):
-            reference_row = reference_file.iloc[i]
-            llm_judge_row = llm_judge_file.iloc[i]
+        for reference, result in zip(reference_rows, results):
+            paths = parse_paths(reference["paths"])
+            if not paths or not all(paths) or len({len(path) for path in paths}) != 1:
+                raise ValueError(f"Invalid reference paths for pair {result['pair_id']}")
+            row = {
+                "id": result["pair_id"],
+                "source": reference["source"],
+                "destination": reference["destination"],
+                "paths": paths,
+                "k": len(paths[0]),
+            }
+            for key in ("raw_response", "prompt", "timestamp", "err", "prompt_spec_id"):
+                value = result.get(key)
+                row[key] = str(value) if pd.notna(value) else ""
+            failed = bool(row["err"].strip())
 
-            pair_id = llm_judge_row.get("pair_id", llm_judge_row.get("id", i))
-            paths_raw = reference_row["paths"]
-            paths = parse_paths(paths_raw)
-            k = len(paths[0]) if paths else 0
-
-            # altering_transformation_id can be int, float (NaN), or missing
-            raw_pred = llm_judge_row.get("altering_transformation_id")
-            if pd.notna(raw_pred) and raw_pred != "":
-                try:
-                    predicted_id = int(float(raw_pred))
-                except (ValueError, TypeError):
-                    raise ValueError(f"Invalid predicted altering_transformation_id: {raw_pred!r} at row {i}")
-               
+            if task_type == TaskType.T1:
+                real = _optional_boolean(reference["is_semantically_equivalent"])
+                if real is None:
+                    raise ValueError(f"Invalid reference label for pair {row['id']}")
+                pred = None if failed else _optional_boolean(result.get("semantic_is_equal"))
+                row.update(real_class=real, predicted_class=pred,
+                           correct=pred is not None and pred == real)
+            elif task_type == TaskType.T2:
+                gold = extract_ground_truth_altering_id(paths)
+                pred = None if failed else _optional_integer(result.get("altering_transformation_id"))
+                if pred not in range(1, 10):
+                    pred = None
+                row.update(ground_truth_altering_id=gold, predicted_id=pred,
+                           correct=pred is not None and pred == gold)
             else:
-                raise ValueError(f"altering_transformation_id is missing or invalid at row {i}")
-           
-           
+                pred = None if failed else parse_predicted_path(result.get("predicted_path"))
+                row.update(predicted_path=pred, correct=pred is not None and pred in paths)
 
-            ground_truth_altering_id = extract_ground_truth_altering_id(paths)
-            correct = int(predicted_id) == int(ground_truth_altering_id)
-
-            row = {
-                "id": int(pair_id) if pd.notna(pair_id) else i,
-                "source": str(reference_row["source"]) if pd.notna(reference_row["source"]) else "",
-                "destination": str(reference_row["destination"]) if pd.notna(reference_row["destination"]) else "",
-                "paths": paths,
-                "ground_truth_altering_id": ground_truth_altering_id,
-                "k": k,
-                "predicted_id": predicted_id,
-                "correct": correct,
-                "raw_response": str(llm_judge_row.get("raw_response", "")) if pd.notna(llm_judge_row.get("raw_response")) else "",
-            }
-            
-            row["prompt"] = str(llm_judge_row.get("prompt", "")) if pd.notna(llm_judge_row.get("prompt")) else ""
-            row["timestamp"] = str(llm_judge_row.get("timestamp", "")) if pd.notna(llm_judge_row.get("timestamp")) else ""
-            row["err"] = str(llm_judge_row.get("err", "")) if pd.notna(llm_judge_row.get("err")) else ""
-
+            if pred is None and not row["err"].strip():
+                row["err"] = "Missing or invalid saved prediction."
             rows.append(row)
 
-        output = {
-            "metadata": {"transformations": _transformation_metadata()},
-            "rows": rows,
-        }
-
-        reference_llm_judge_file_name = f'reference_llm_judge_{run_id}.json'
-        reference_llm_judge_path = os.path.join(folder_path, reference_llm_judge_file_name)
-
-        with open(reference_llm_judge_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
-
-        print(f"Wrote {len(rows)} rows to {reference_llm_judge_path}")
-
-
-    @staticmethod
-    def __create_json_file_for_t3(
-        folder_path: str, 
-        llm_judge_file_path: str, 
-        refernce_file_path: str,
-        run_id: str
-    ):
-
-        llm_judge_file = pd.read_csv(llm_judge_file_path)
-        reference_file = pd.read_csv(refernce_file_path)
-
-
-        if len(llm_judge_file) != len(reference_file):
-            raise ValueError(
-                f"Row count mismatch: source has {len(reference_file)}, results has {len(llm_judge_file)}"
-            )
-
-        rows = []
-        for i in range(len(reference_file)):
-            reference_row = reference_file.iloc[i]
-            llm_judge_row = llm_judge_file.iloc[i]
-
-            pair_id = llm_judge_row.get("pair_id", reference_row.get("id", i))
-            paths_raw = reference_row["paths"]
-            paths = parse_paths(paths_raw)
-            k = len(paths[0]) if paths else 0
-
-            predicted_path = parse_predicted_path(llm_judge_row.get("predicted_path"))
-
-            row = {
-                "id": int(pair_id) if pd.notna(pair_id) else i,
-                "source": str(reference_row["source"]) if pd.notna(reference_row["source"]) else "",
-                "destination": str(reference_row["destination"]) if pd.notna(reference_row["destination"]) else "",
-                "paths": paths,
-                "k": k,
-                "predicted_path": predicted_path,
-                "raw_response": str(llm_judge_row.get("raw_response", "")) if pd.notna(llm_judge_row.get("raw_response")) else "",
+        if task_type == TaskType.T1:
+            output = rows  # Keep the list format consumed by compute_t1_metrics.py.
+        else:
+            output = {
+                "metadata": {
+                    "transformations": _transformation_metadata(),
+                    "reference_count": reference_count,
+                    "completed_count": len(rows),
+                    "is_partial": len(rows) < reference_count,
+                },
+                "rows": rows,
             }
-            
-            row["prompt"] = str(llm_judge_row.get("prompt", "")) if pd.notna(llm_judge_row.get("prompt")) else ""
-            row["timestamp"] = str(llm_judge_row.get("timestamp", "")) if pd.notna(llm_judge_row.get("timestamp")) else ""
-            row["err"] = str(llm_judge_row.get("err", "")) if pd.notna(llm_judge_row.get("err")) else ""
-
-            rows.append(row)
-
-        output = {
-            "metadata": {"transformations": _transformation_metadata()},
-            "rows": rows,
-        }
-
-        reference_llm_judge_file_name = f'reference_llm_judge_{run_id}.json'
-        reference_llm_judge_path = os.path.join(folder_path, reference_llm_judge_file_name)
-
-        with open(reference_llm_judge_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
-
-        print(f"Wrote {len(rows)} rows to {reference_llm_judge_path}")
-
-
-
-
-
-
-
-
-
+        output_path = Path(folder_path) / f"reference_llm_judge_{run_id}.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")

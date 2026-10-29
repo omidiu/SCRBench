@@ -451,18 +451,20 @@ def count_unique_inner_sets(row_path):
 
 
 
-def parse_predicted_path(raw) -> list | None:
-    """Parse predicted_path from CSV (can be string like '[5, 7, 1]' or list)."""
-    if pd.isna(raw) or raw == "":
-        raise ValueError("predicted_path is missing or NaN")
-   
-    if isinstance(raw, (list, tuple)):
-        return [int(x) for x in raw if str(x).strip().isdigit()]
+def parse_predicted_path(raw) -> list[int] | None:
+    """Decode a saved prediction; missing or malformed sequences remain missing."""
     if isinstance(raw, str):
         try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [int(x) for x in parsed if isinstance(x, (int, float))]
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-    raise ValueError(f"Unable to parse predicted_path: {raw!r}")
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    ids = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value not in range(1, 10):
+            return None
+        ids.append(int(value))
+    return ids

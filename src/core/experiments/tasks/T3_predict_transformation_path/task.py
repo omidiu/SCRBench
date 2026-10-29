@@ -74,7 +74,7 @@ class T3PredictTransformationPathTask:
         except Exception as e:
             output = T3PredictTransformationPathTaskRowOutput(
                 pair_id=pair_id,
-                raw_response=raw_response_for_output if raw_response_for_output else f"Error: {e}",
+                raw_response=raw_response_for_output if raw_response_for_output is not None else f"Error: {e}",
                 timestamp=timestamp,
                 err=str(e),
                 prompt_spec_id=prompt_spec_id,
