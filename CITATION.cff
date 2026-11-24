@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use SCRBench, please cite the accompanying paper."
+title: "SCRBench: Beyond Equivalence Checking for Semantic Change Reasoning in Code"
+type: software
+license: MIT
+authors:
+  - given-names: Omid
+    family-names: Saghatchian
+  - given-names: Ali
+    family-names: Mahzoun
+  - given-names: Khashayar
+    family-names: Etemadi
+  - given-names: Saeed Reza
+    family-names: Kheradpisheh
+repository-code: "https://github.com/omidiu/SCRBench"
+url: "https://arxiv.org/abs/2610.41562"
+preferred-citation:
+  type: article
+  title: "SCRBench: Beyond Equivalence Checking for Semantic Change Reasoning in Code"
+  authors:
+    - given-names: Omid
+      family-names: Saghatchian
+    - given-names: Ali
+      family-names: Mahzoun
+    - given-names: Khashayar
+      family-names: Etemadi
+    - given-names: Saeed Reza
+      family-names: Kheradpisheh
+  journal: arXiv
+  year: 2026
+  url: "https://arxiv.org/abs/2610.41562"

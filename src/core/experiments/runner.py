@@ -1,0 +1,349 @@
+import os
+import math
+import re
+import time
+from dataclasses import dataclass, fields
+from typing import Optional, Tuple, Type
+
+import pandas as pd
+import json
+from pathlib import Path
+from core import project_config
+
+from .enums import LLMModel, ReferenceDataset, TaskType
+from .published_data import resolve_reference_file
+from .prompt_spec import PromptSpec
+from .tasks import resolve_prompt_spec
+from .io import validate_columns
+from .reporting import ExperimentReport, utc_now_iso, write_report_json
+from .tasks import TASK_REGISTRY
+from .tasks.base import ExperimentTask, TaskRowOutput
+from core.utils import extract_ground_truth_altering_id, parse_sequence_set, parse_predicted_sequence
+
+def _sanitize_filename_component(s: str) -> str:
+    s = s.strip()
+    s = s.replace("/", "__").replace(":", "__")
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+    return s[:180] if len(s) > 180 else s
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    model_name: LLMModel
+    prompt_spec: PromptSpec
+    task_type: TaskType
+
+    reference_file_name: ReferenceDataset
+    reference_folder_path: Optional[str] = None
+    experiment_folder_path: str = os.path.join(project_config.PROJECT_ROOT, project_config.EXPERIMENT_RESULTS_DIR)
+
+    # Execution
+    chunksize: int = 250
+    max_rows: Optional[int] = None
+    show_progress: bool = True
+
+    # OpenRouter
+    max_tokens: int = 4000
+
+
+def run_experiment(cfg: ExperimentConfig) -> Tuple[str, str]:
+    task_type_str = cfg.task_type.value
+    model_name_str = cfg.model_name.value
+    reference_file_name_str = cfg.reference_file_name.value
+
+    if task_type_str not in TASK_REGISTRY:
+        raise ValueError(f"Unknown task_type={cfg.task_type!r}. Known tasks: {sorted(TASK_REGISTRY.keys())}")
+
+    prompt_spec = resolve_prompt_spec(cfg.task_type, cfg.prompt_spec)
+    prompt_spec_id = prompt_spec.id
+    task_cls: Type[ExperimentTask] = TASK_REGISTRY[task_type_str]
+    task_kwargs = {
+        "model_name": model_name_str,
+        "max_tokens": cfg.max_tokens,
+        "prompt_spec": prompt_spec,
+    }
+
+    task: ExperimentTask = task_cls(**task_kwargs)  # type: ignore[call-arg]
+
+    required_columns = ["id", "source", "destination", "paths", "is_semantically_equivalent", "k"]
+    reference_file_path = str(resolve_reference_file(cfg.reference_file_name, cfg.reference_folder_path))
+
+    task_safe = _sanitize_filename_component(task_type_str)
+    reference_safe = _sanitize_filename_component(reference_file_name_str)
+    model_safe = _sanitize_filename_component(model_name_str)
+    prompt_safe = _sanitize_filename_component(prompt_spec_id)
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+    folder_path = os.path.join(cfg.experiment_folder_path, task_safe, reference_safe, model_safe, prompt_safe)
+    os.makedirs(folder_path, exist_ok=True)
+
+    llm_judge_file_name = f"llm_judge_{run_id}.csv"
+    report_file_name = f"report_{run_id}.json"
+
+    llm_judge_file_path = os.path.join(folder_path, llm_judge_file_name)
+    report_file_path = os.path.join(folder_path, report_file_name)
+
+    report = ExperimentReport(
+        run_id=run_id,
+        task_name=task_type_str,
+        model_name=model_name_str,
+        reference_file_path=reference_file_path,
+        llm_judge_file_path=llm_judge_file_path,
+        report_file_path=report_file_path,
+        started_at=utc_now_iso(),
+        extra={
+            "chunksize": cfg.chunksize,
+            "max_rows": cfg.max_rows,
+            "max_tokens": cfg.max_tokens,
+            "prompt_spec_id": prompt_spec_id,
+        },
+    )
+
+    header_written = False
+    pbar = None
+    total_rows_for_progress: Optional[int] = None
+
+    try:
+        reference_frame = pd.read_parquet(reference_file_path)
+        validate_columns(reference_frame, required_columns, context=reference_file_path)
+        total_rows_in_file = len(reference_frame)
+        if cfg.show_progress:
+            try:
+                from tqdm.auto import tqdm  # type: ignore
+
+                total_rows_for_progress = total_rows_in_file
+                if cfg.max_rows is not None:
+                    total_rows_for_progress = min(total_rows_for_progress, cfg.max_rows)
+
+                report.extra["total_rows_in_file"] = total_rows_in_file
+                report.extra["total_rows_for_run"] = total_rows_for_progress
+
+                pbar = tqdm(
+                    total=total_rows_for_progress,
+                    desc=f"{task_type_str} [{model_name_str}]",
+                    unit="row",
+                    dynamic_ncols=True,
+                    mininterval=0.5,
+                )
+            except Exception:
+                # Progress is best-effort; never break an experiment because of it.
+                pbar = None
+
+        if cfg.max_rows is not None:
+            reference_frame = reference_frame.iloc[:cfg.max_rows]
+        for start in range(0, len(reference_frame), cfg.chunksize):
+            chunk = reference_frame.iloc[start:start + cfg.chunksize]
+
+            outputs: list[TaskRowOutput] = []
+
+            for row in chunk.itertuples(index=False):
+                report.input_rows_processed += 1
+                result = task.run_row(row)
+
+                if result.cache_hit:
+                    report.cache_hits += 1
+                else:
+                    report.llm_calls += 1
+
+                if result.parse_unknown:
+                    report.response_parse_unknown += 1
+
+                elif result.output.err:
+                    report.error_rows += 1
+
+                outputs.append(result.output)
+
+                if report.extra.get("output_columns") is None:
+                    report.extra["output_columns"] = [f.metadata.get("csv_name", f.name) for f in fields(type(result.output))]
+
+                if pbar is not None:
+                    pbar.update(1)
+                    if report.input_rows_processed % 25 == 0:
+                        remaining = None
+                        if total_rows_for_progress is not None:
+                            remaining = max(0, total_rows_for_progress - report.input_rows_processed)
+                        pbar.set_postfix(
+                            {
+                                "left": remaining,
+                                "cache": report.cache_hits,
+                                "llm": report.llm_calls,
+                                "err": report.error_rows,
+                            }
+                        )
+
+            out_df = pd.DataFrame([
+                {f.metadata.get("csv_name", f.name): getattr(output, f.name)
+                 for f in fields(output)}
+                for output in outputs
+            ])
+            out_df.to_csv(llm_judge_file_path, mode="a", index=False, header=not header_written)
+            header_written = True
+            report.output_rows_written += len(out_df)
+
+    finally:
+
+        try:
+            AggregateWithReferenceFile.aggregate_with_reference_file(
+                task_type=cfg.task_type,
+                folder_path=folder_path,
+                llm_judge_file_path=llm_judge_file_path,
+                refernce_file_path=reference_file_path,
+                run_id=run_id
+            )
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+            finished = utc_now_iso()
+            report.finished_at = finished
+            try:
+                from datetime import datetime
+
+                started_dt = datetime.fromisoformat(report.started_at)
+                finished_dt = datetime.fromisoformat(finished)
+                report.duration_seconds = (finished_dt - started_dt).total_seconds()
+            except Exception:
+                report.duration_seconds = None
+
+            write_report_json(report)
+
+    return llm_judge_file_path, report_file_path
+
+def _transformation_metadata() -> dict:
+    from core.data_builder.transformations import ALL_TRANSFORMATIONS
+
+    return {
+        str(t.id): {
+            "name": t.name,
+            "short_description": t.short_description,
+        }
+        for t in ALL_TRANSFORMATIONS
+    }
+
+
+def _optional_integer(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if math.isfinite(number) and number.is_integer() else None
+
+
+def _optional_boolean(value) -> bool | None:
+    if pd.isna(value):
+        return None
+    token = str(value).strip().lower()
+    if token in ("true", "1", "1.0"):
+        return True
+    if token in ("false", "0", "0.0"):
+        return False
+    return None
+
+
+class AggregateWithReferenceFile:
+    """Export completed predictions, aligned by ID, including failed responses.
+
+    Partial runs export only completed rows; unattempted examples are not scored.
+    Duplicate, missing, or unknown pair IDs are rejected rather than guessed.
+    """
+
+    @staticmethod
+    def _read_aligned_rows(result_path: str, reference_path: str):
+        if not str(reference_path).endswith(".parquet"):
+            raise ValueError(f"Reference input must be a Parquet file: {reference_path}")
+        reference = pd.read_parquet(reference_path)
+        if Path(result_path).is_file():
+            try:
+                results = pd.read_csv(result_path, keep_default_na=False)
+            except pd.errors.EmptyDataError:
+                results = pd.DataFrame(columns=["pair_id"])
+        else:
+            results = pd.DataFrame(columns=["pair_id"])
+
+        for frame, column in ((reference, "id"), (results, "pair_id")):
+            if column not in frame:
+                raise ValueError(f"Missing required ID column: {column}")
+            ids = frame[column].map(_optional_integer)
+            if ids.isna().any() or ids.duplicated().any():
+                raise ValueError(f"Missing, invalid, or duplicate IDs in {column}")
+            frame[column] = ids.astype("int64")
+
+        unknown = set(results["pair_id"]) - set(reference["id"])
+        if unknown:
+            raise ValueError(f"Result pair IDs absent from reference: {sorted(unknown)}")
+        aligned = reference.set_index("id").loc[results["pair_id"]]
+        return aligned.to_dict("records"), results.to_dict("records"), len(reference)
+
+    @classmethod
+    def aggregate_with_reference_file(
+        cls,
+        task_type: TaskType,
+        folder_path: str,
+        llm_judge_file_path: str,
+        refernce_file_path: str,
+        run_id: str,
+    ):
+        if task_type not in (TaskType.T1, TaskType.T2, TaskType.T3):
+            raise ValueError(f"Unsupported task type: {task_type}")
+        reference_rows, results, reference_count = cls._read_aligned_rows(
+            llm_judge_file_path, refernce_file_path
+        )
+        rows = []
+        for reference, result in zip(reference_rows, results):
+            sequence_set = parse_sequence_set(reference["paths"])
+            if not sequence_set or not all(sequence_set) or len({len(transformation_sequence) for transformation_sequence in sequence_set}) != 1:
+                raise ValueError(f"Invalid reference paths for pair {result['pair_id']}")
+            row = {
+                "id": result["pair_id"],
+                "source": reference["source"],
+                "destination": reference["destination"],
+                "paths": sequence_set,
+                "k": len(sequence_set[0]),
+            }
+            for key in ("raw_response", "prompt", "timestamp", "err", "prompt_spec_id"):
+                value = result.get(key)
+                row[key] = str(value) if pd.notna(value) else ""
+            failed = bool(row["err"].strip())
+
+            if task_type == TaskType.T1:
+                real = _optional_boolean(reference["is_semantically_equivalent"])
+                if real is None:
+                    raise ValueError(f"Invalid reference label for pair {row['id']}")
+                pred = None if failed else _optional_boolean(result.get("semantic_is_equal"))
+                row.update(real_class=real, predicted_class=pred,
+                           correct=pred is not None and pred == real)
+            elif task_type == TaskType.T2:
+                gold = extract_ground_truth_altering_id(sequence_set)
+                pred = None if failed else _optional_integer(result.get("altering_transformation_id"))
+                if pred not in range(1, 10):
+                    pred = None
+                row.update(ground_truth_altering_id=gold, predicted_id=pred,
+                           correct=pred is not None and pred == gold)
+            else:
+                pred = None if failed else parse_predicted_sequence(result.get("predicted_path"))
+                row.update(predicted_path=pred, correct=pred is not None and pred in sequence_set)
+
+            if pred is None and not row["err"].strip():
+                row["err"] = "Missing or invalid saved prediction."
+            rows.append(row)
+
+        if task_type == TaskType.T1:
+            output = rows
+        else:
+            output = {
+                "metadata": {
+                    "transformations": _transformation_metadata(),
+                    "reference_count": reference_count,
+                    "completed_count": len(rows),
+                    "is_partial": len(rows) < reference_count,
+                },
+                "rows": rows,
+            }
+        output_path = Path(folder_path) / f"reference_llm_judge_{run_id}.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
